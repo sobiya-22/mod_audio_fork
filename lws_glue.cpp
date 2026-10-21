@@ -918,19 +918,18 @@ extern "C" {
 switch_bool_t dub_speech_frame(switch_media_bug_t *bug, private_t* tech_pvt) {
     if (!tech_pvt) return SWITCH_TRUE;
 
-    static uint32_t call_count = 0;
-    static uint32_t underrun_count = 0;
-    call_count++;
+    tech_pvt->playout_call_count++;
 
     // Usar lock BLOQUEANTE - crítico para sincronização
     switch_mutex_lock(tech_pvt->mutex);
 
     CircularBuffer_t *cBuffer = (CircularBuffer_t *) tech_pvt->streamingPlayoutBuffer;
 
-    if (call_count % 50 == 0) {
+    if (tech_pvt->playout_call_count % 50 == 0) {
         switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
-                         "(%u) SISTEMA ATIVO #%u: Buffer=%zu samples, Underruns=%u\n",
-                         tech_pvt->id, call_count, cBuffer->size(), underrun_count);
+                         "(%u) SISTEMA ATIVO #%u: Buffer=%zu samples, Underruns=%u (partial=%u)\n",
+                         tech_pvt->id, tech_pvt->playout_call_count, cBuffer->size(),
+                         tech_pvt->playout_underrun_count, tech_pvt->playout_partial_underrun_count);
     }
 
     // Lógica de clear buffer
@@ -967,17 +966,30 @@ switch_bool_t dub_speech_frame(switch_media_bug_t *bug, private_t* tech_pvt) {
             int16_t *fp = reinterpret_cast<int16_t*>(rframe->data);
             int samples_needed = rframe->samples;
 
-            // Verificar dados disponíveis
-            int samplesToCopy = std::min(static_cast<int>(cBuffer->size()), samples_needed);
+            // Only ever replace this RTP frame with a FULL frame of real
+            // audio, or with full silence. The previous logic copied
+            // whatever was available (samplesToCopy = min(buffer, needed))
+            // into the front of the frame and left the *rest* zero —
+            // so a buffer that was even one sample short of a full frame
+            // produced [real audio samples][hard digital zero] inside the
+            // same 20ms RTP packet. That abrupt mid-waveform step to zero,
+            // emitted mid-utterance whenever the write side fell briefly
+            // behind (normal jitter, not just a true end-of-utterance
+            // underrun), is an audible click — reported as crackled bot
+            // playback by a downstream consumer. Requiring a full frame
+            // before replacing means a partial buffer is treated the same
+            // as empty (pure silence this tick); the leftover real samples
+            // stay queued in cBuffer and go out whole on a later tick
+            // instead of being spliced against silence.
+            bool haveFullFrame = static_cast<int>(cBuffer->size()) >= samples_needed;
 
-            if (samplesToCopy > 0) {
-                // Preparar dados com silêncio
+            if (haveFullFrame) {
                 std::vector<int16_t> data(samples_needed, 0);
-                std::copy_n(cBuffer->begin(), samplesToCopy, data.begin());
-                cBuffer->erase(cBuffer->begin(), cBuffer->begin() + samplesToCopy);
+                std::copy_n(cBuffer->begin(), samples_needed, data.begin());
+                cBuffer->erase(cBuffer->begin(), cBuffer->begin() + samples_needed);
 
                 // Processar marcadores
-                for (int i = 0; i < samplesToCopy; i++) {
+                for (int i = 0; i < samples_needed; i++) {
                     if ((uint16_t)data[i] == AUDIO_MARKER && nullptr != tech_pvt->pVecMarksInUse) {
                         std::deque<std::string>* pVecMarksInUse = static_cast<std::deque<std::string>*>(tech_pvt->pVecMarksInUse);
                         std::deque<std::string>* pVecMarksCleared = static_cast<std::deque<std::string>*>(tech_pvt->pVecMarksCleared);
@@ -1006,8 +1018,14 @@ switch_bool_t dub_speech_frame(switch_media_bug_t *bug, private_t* tech_pvt) {
                 switch_core_media_bug_set_write_replace_frame(bug, rframe);
 
             } else {
-                underrun_count++;
-                // Buffer vazio: enviar silêncio para evitar picotes
+                if (!cBuffer->empty()) {
+                    // Partial data queued but not enough for a full frame
+                    // yet — count separately from a true empty-buffer
+                    // underrun so the two are distinguishable in logs.
+                    tech_pvt->playout_partial_underrun_count++;
+                }
+                tech_pvt->playout_underrun_count++;
+                // Buffer vazio (ou insuficiente): enviar silêncio para evitar picotes
                 memset(fp, 0, samples_needed * sizeof(int16_t));
                 rframe->channels = 1;
                 rframe->datalen = samples_needed * sizeof(int16_t);

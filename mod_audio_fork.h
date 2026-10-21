@@ -71,6 +71,12 @@ struct private_data {
   int bidirectional_audio_sample_rate;
   int clear_bidirectional_audio_buffer;
 
+  // Per-session playout stats (was process-global `static` in
+  // dub_speech_frame, which mixed counters across concurrent calls).
+  unsigned int playout_call_count;
+  unsigned int playout_underrun_count;
+  unsigned int playout_partial_underrun_count;
+
   switch_codec_t raw_write_codec;
   int raw_write_codec_initialized;
   uint32_t write_ts;
